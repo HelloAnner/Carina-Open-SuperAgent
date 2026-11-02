@@ -1,0 +1,638 @@
+Carina 技术架构方案 v0.1
+
+状态：讨论稿，未实现。业务目标见 prd.md，逻辑架构见 architecture.md。
+本文只描述技术落地：选型、分层、部署、核心链路、扩展点、数据与一致性、首期拆分。
+
+
+0. 一句话方案
+--------------------------------------------------------------------
+
+pnpm monorepo + TypeScript。Postgres 存全部状态，Redis 只做唤醒/租约/缓存。
+api、worker、web 三个进程，同一套镜像，docker-compose 起 pg、redis、api、worker、web。
+核心链路固定为：
+
+  Source -> Trigger -> Thread -> (Fast Path 订阅直通 | Slow Path Router 批处理)
+         -> Task -> Assignment -> Worker Session -> Report -> Outbox -> Channel
+
+可扩展点只有两个 SPI：
+  SourceKind        接入新的 trigger 来源
+  WorkerRuntime     接入新的 worker session 实现
+
+其他模块都围绕这两个 SPI 和固定的域模型工作，不为此改核心。
+
+
+1. 技术选型
+--------------------------------------------------------------------
+
+运行时         Node 22 LTS
+语言           TypeScript strict
+包管理         pnpm workspace
+API            Fastify + zod + OpenAPI；SSE 推进前端事件
+数据库         PostgreSQL 16，Drizzle ORM，SQL 迁移入库
+队列/协调      Redis 7：wakeup、租约、限流、缓存、SSE 扇出
+前端           React 18 + Vite + TanStack Query，Nginx 托管静态文件
+鉴权           OIDC / 企业 SSO 适配器；开发环境内置本地登录
+模型           统一 ModelGateway，兼容 OpenAI / Anthropic / 自建兼容接口
+对象存储       第一版本地 volume；预留 S3 兼容适配器
+测试           vitest；核心域纯函数单测 + 一条 compose 集成链路
+
+原则：
+- Postgres 是唯一事实来源。Redis 丢失只影响速度，不影响正确性。
+- 不引入 Kafka、图数据库、向量库、独立消息总线。没有测量数据前不加。
+- 逻辑模块 != 微服务。首期只有 api 和 worker 两个可执行进程。
+
+
+2. 部署拓扑（docker-compose）
+--------------------------------------------------------------------
+
+                      ┌────────────────────────────┐
+                      │  browser                   │
+                      └─────────────┬──────────────┘
+                                    │ http / sse
+                      ┌─────────────▼──────────────┐
+                      │  web  (nginx + SPA) :3000  │
+                      └─────────────┬──────────────┘
+                                    │ /api
+                      ┌─────────────▼──────────────┐
+                      │  api  (Fastify) :8080      │
+                      │  鉴权 / 查询 / 管理 / SSE  │
+                      └───┬──────────────────┬─────┘
+                          │                  │
+          ┌───────────────▼────┐   ┌─────────▼──────────────┐
+          │ postgres:16        │   │ redis:7                │
+          │ 全部业务状态        │   │ wakeup / lease / cache │
+          └───────────────▲────┘   └─────────▲──────────────┘
+                          │                  │
+                      ┌───┴──────────────────┴─────┐
+                      │  worker                    │
+                      │  router loop               │
+                      │  executor loop             │
+                      │  outbox relay              │
+                      │  watchdog tick             │
+                      └──────────┬─────────────────┘
+                                 │
+                      ┌──────────▼─────────────────┐
+                      │ artifacts volume           │
+                      │ workdir / spill / 附件     │
+                      └────────────────────────────┘
+
+compose 服务：
+  postgres   持久卷，启动执行迁移
+  redis      无持久要求，可 AOF
+  api        无状态，可多副本
+  worker     同一镜像，command 不同；首期单副本
+  web        静态站点，/api 反代到 api
+
+后续拆分只需把 worker 的 loop 按角色拆成多个容器：
+  worker-router、worker-executor、worker-outbox、worker-watchdog。
+首期不拆，避免一个空壳微服务拆出一堆运维成本。
+
+关键环境变量：
+  DATABASE_URL / REDIS_URL / PUBLIC_BASE_URL
+  OIDC_ISSUER / OIDC_CLIENT_ID / OIDC_CLIENT_SECRET
+  MODEL_GATEWAY_URL / MODEL_GATEWAY_KEY
+  WORKER_ROLE=all|router|executor|outbox|watchdog
+  ARTIFACT_DIR=/data/artifacts
+
+
+3. 仓库分层
+--------------------------------------------------------------------
+
+carina/
+  apps/
+    api/            HTTP 入口：鉴权、查询、管理、SSE
+    worker/         消费循环入口：router / executor / outbox / watchdog
+    web/            React SPA
+  packages/
+    contracts/      域类型、zod schema、事件定义、SPI 接口
+    core/           纯域逻辑：状态机、路由判定、批处理、权限决策
+    persistence/    Drizzle schema、Repository 实现、迁移
+    queue/          Postgres inbox 领取、Redis wakeup、租约与 fencing
+    sources/        Source 注册表 + github / feishu / webhook 适配器
+    agent/          ModelGateway、Router 会话、上下文组装、召回工具
+    runtime/        WorkerRuntime SPI + builtin/runtime-http 实现 + Tool 执行
+    channels/       Channel 适配器：IM 回复、PR 评论、平台通知
+    observability/  日志、指标、trace、审计辅助
+  docker/
+    compose.yml
+    Dockerfile
+    nginx.conf
+
+依赖方向（只允许向右）：
+
+  apps  ->  agent / runtime / sources / channels  ->  core  ->  contracts
+                    \______________________  persistence / queue  ______/
+
+  core 不 import 任何外部 IO；所有外部依赖通过 contracts 里的 Port 注入。
+  新增 Source 不改 core；新增 WorkerRuntime 不改 core。
+  apps 只做编排和入口，不放业务规则。
+
+
+4. 域模型落地
+--------------------------------------------------------------------
+
+沿用参考仓库的主干，按 Carina 的命名落表：
+
+  Tenant            企业
+  Domain            协作域（上下文与授权边界）
+  SourceInstance    一个来源配置：github owner/repo、feishu chat、webhook
+  Trigger           一条不可变外部事件
+  Thread            来源内的连续事件流，如一个 PR、一个 IM 话题、一个工单
+  Subscription      Thread 与 Task 的多对多订阅
+  Evaluation        Router 对一批 Trigger 的判定记录
+  Task              一项被授权的工作
+  Assignment        Task 与一次执行尝试的绑定
+  WorkerSession     一次 Worker 执行会话
+  Report            Worker 向 Task / Router 的结构化汇报
+  Channel           写侧适配器
+  Outbox            待发送消息
+  KnowledgeEntry    项目知识：事实 / 已确认规则 / 推断 / 待确认
+  Approval          高风险动作审批
+  AuditLog          可追溯记录
+
+参考仓库到 Carina 的映射：
+
+  Source     -> SourceInstance + SourceKind
+  Trigger    -> Trigger
+  Thread     -> Thread
+  Eval       -> Evaluation（Gate 程序层 + Router 语义层）
+  Ticket     -> Task
+  Assignment -> Assignment
+  Executor   -> WorkerRuntime
+  Channel    -> Channel
+  Policy     -> DomainPolicy（版本化）
+
+
+5. 核心链路
+--------------------------------------------------------------------
+
+5.1 总体时序
+
+  外部系统
+     │ webhook / poll
+     ▼
+  [api.ingest]
+     │ 1 验签、租户与来源校验
+     │ 2 规范化成 Trigger envelope
+     │ 3 按 (tenant, source, source_event_id) 去重
+     │ 4 同一事务写 triggers + thread + inbox + outbox(内部)
+     ▼
+  Redis wakeup ──► [worker]
+                     │
+                     ├─ 5 Fast Path：已订阅 Thread -> 直接 append WorkerInbox
+                     │
+                     └─ 6 Slow Path：无订阅 -> 进入 Router batch
+                              │
+                              ▼
+                        Router Session（每个 Domain 单写者）
+                          ├ ignore：记录 disposition，结束
+                          ├ reply：Outbox 简短回复，结束
+                          ├ link：关联已有 Task
+                          └ create_task：写 Task + Mandate
+                                     │
+                                     ▼
+                              Assignment pending
+                                     │
+                                     ▼
+                        Executor loop 领取 -> WorkerRuntime.start
+                                     │
+                           Worker 事件流（增量落库）
+                                     │
+                     ┌───────────────┼────────────────┐
+                     ▼               ▼                ▼
+                Report 关键事件   Tool 调用      会话结束
+                     │               │                │
+                     └──────► Router / Task 状态 ◄─────┘
+                                     │
+                                     ▼
+                              Outbox -> Channel
+                                     │
+                                     ▼
+                              来源平台 / 平台页面
+
+5.2 Fast Path（确定性，不调模型）
+
+输入：已持久化的 Trigger + 它的 thread_key。
+步骤：
+  1 校验 tenant / domain / source 启用状态。
+  2 查 thread_subscriptions 中 active 的 Task。
+  3 对每个订阅写一条 worker_inbox 记录，带 trigger_id、task_id、assignment_id。
+  4 同一 (worker_session_id, trigger_id) 唯一约束保证幂等。
+  5 若存在 task 上未决的 delete/cancel 控制事件，先处理控制，不投递。
+输出：投递完成；不创建 Evaluation。
+
+注意：订阅只提供上下文，不自动授予新权限。Task 的授权仍以创建时的 Mandate 为准。
+
+5.3 Slow Path（Router 批处理）
+
+触发条件：Thread 无有效订阅，或事件明确要求跨任务协调。
+批次约束：
+  max_wait_ms      默认 1500
+  max_events       默认 20
+  max_input_tokens 默认 30k
+  max_consecutive  单 Domain 同时只跑一个 Router 批次
+
+批次内容：
+  本批 Trigger（按来源顺序）
+  Thread 快照
+  该 Thread 上全部 Task（含已结束，用于查重）
+  DomainPolicy 版本
+  相关任务摘要与未决决策
+
+Router 输出（结构化 JSON，schema 校验后才落库）：
+  { kind: "ignore" | "reply" | "link" | "create_task" | "cancel" | "unavailable" }
+  create_task 必带：title, scope, acceptance, source_trigger_ids, strength,
+                    allowed_actions, budget, worker_runtime_hint
+  非法输出重试一次，仍失败记 unavailable，不猜测执行。
+
+单写者：
+  Redis SET domain:{id}:router:lease 持有租约；
+  Postgres 的 domain_router_state.fencing_token 每次加一。
+  所有批次写入校验 fencing_token，旧租约写入被拒绝。
+
+5.4 Task 与 Assignment
+
+Task 状态：
+  open -> running -> awaiting_input / awaiting_approval / blocked
+       -> succeeded / failed / cancelled
+  人工可暂停、恢复、重开；每次执行产生新 Assignment，旧记录保留。
+
+Assignment 状态：
+  pending -> running -> succeeded / failed / cancelled / uncertain
+
+派工契约（WorkerSpec）包含：
+  task_id, goal, acceptance, domain_id
+  allowed_reads / allowed_actions / actor identity
+  repo base version, workspace ref, plan_version
+  context entrypoints, confirmed constraints, related in-flight tasks
+  budget (tokens, wall clock, cost), deadline, cancel token
+  output requirements: artifacts, evidence, unresolved risks
+
+5.5 Worker Session 内部
+
+  start(operation) -> operation_id（立即返回，不同步阻塞）
+  后台执行 -> 完成事件进入自己的 inbox
+  新输入在当前推理步结束后处理
+  cancel 每步检查；外部动作不可撤回时标 uncertain
+
+Worker 不直接对外发消息。沟通性输出写成 Report / Outbox 候选，由 Router 或输出网关统一发送。
+Worker 的会话事件、工具调用、证据全部落库；长内容写 artifacts，库里只存引用。
+
+5.6 事件与 Outbox
+
+所有跨进程动作采用"先记录意图，再执行，再记录结果"：
+  业务事务 -> outbox 行（同事务）
+  outbox relay -> 发送 -> 标记 sent / retry / dead
+  外部无幂等键时，发送前查询目标状态，超时记 uncertain，不盲目重试。
+内部 wakeup 只是加速：
+  Postgres inbox 由 worker 用 FOR UPDATE SKIP LOCKED 领取；
+  Redis 发信号减少轮询延迟，丢了也能靠轮询兜底。
+
+
+6. 数据模型
+--------------------------------------------------------------------
+
+6.1 Postgres 表（首期）
+
+  tenants
+  users
+  memberships              user x tenant x role
+  domains                  tenant_id, name, isolation_policy
+  domain_members           domain 级可见范围
+  source_instances         tenant_id, domain_id, kind, config, enabled
+  source_cursors           拉取型来源的读取位置
+  triggers                 id, tenant, domain, source, source_event_id, thread_key,
+                           actor, object_type, object_id, version, occurred_at, payload_ref,
+                           correlation_id, causation_id, raw_ref
+  trigger_dispositions     trigger_id, result, reason, eval_id
+  threads                  thread_key, tenant, domain, source, object_type, object_id,
+                           last_trigger_at, version
+  thread_subscriptions     thread_key, task_id, purpose, state
+  evaluations              id, domain_id, thread_key, trigger_ids, policy_version,
+                           status, decision, model_usage, started_at, ended_at
+  tasks                    id, domain_id, title, scope, state, mandate, origin_trigger_id,
+                           acceptance, budget, plan_version
+  assignments              id, task_id, runtime_type, state, attempt, fencing_token,
+                           started_at, ended_at, result
+  worker_sessions          id, task_id, assignment_id, runtime_type, state,
+                           resume_token, workspace_ref, budget_used
+  worker_inputs            id, task_id, assignment_id, kind, trigger_id, text, state,
+                           delivered_at, consumed_at
+  session_events           id, session_id, seq, type, payload, at
+  reports                  id, task_id, assignment_id, kind, body, created_at
+  outbox                   id, tenant, domain, channel, address, body, idem_key,
+                           status, attempts, next_attempt_at, sent_at
+  approvals                id, task_id, action, target_version, status, approver, expires_at
+  knowledge_entries        id, domain_id, kind, title, body, sources, status, version
+  knowledge_reviews        知识确认 / 失效 / 替代记录
+  artifacts                id, tenant, domain, task_id, kind, mime, size, storage_key, sha256
+  audit_logs               id, tenant, actor, action, object, before, after, at
+  usage_records            id, domain, task, model, tokens, cost, at
+  watch_alerts             id, domain, task, kind, severity, state, detail
+
+关键索引：
+  triggers (tenant_id, source, source_event_id) UNIQUE
+  triggers (domain_id, thread_key, occurred_at)
+  thread_subscriptions (thread_key, task_id) UNIQUE
+  worker_inputs (worker_session_id, trigger_id) UNIQUE
+  outbox (status, next_attempt_at)
+  tasks (domain_id, state)
+  session_events (session_id, seq) UNIQUE
+
+6.2 Redis 用途
+
+  wakeup:{queue}          List/Stream，仅通知有新工作
+  lease:domain:{id}:router  SET NX PX
+  lease:session:{id}        Worker 会话租约
+  ratelimit:{actor|source}  限流
+  cache:policy:{domain}     策略版本缓存
+  sse:domain:{id}           API 多副本 SSE 扇出
+  dedupe:short:{hash}       短窗口去重（可选，长期去重仍在 PG）
+
+6.3 对象引用
+
+  所有对象统一 ID；长内容不直接塞表，写 artifacts 并保留：
+    storage_key, sha256, size, mime, truncated, next_cursor
+  召回工具每次返回：对象 ID、版本、是否截断、续读入口。
+  引用关系先落 PG 外键/关联表，不上图数据库。
+
+
+7. 扩展点 A：Trigger / Source
+--------------------------------------------------------------------
+
+7.1 SPI 定义
+
+  // packages/contracts/src/source.ts
+  export interface SourceKind<C = unknown> {
+    kind: string
+    configSchema: z.ZodType<C>
+
+    // 接收模式：webhook 推、poll 拉，二者可同时存在
+    webhook?: {
+      verify(req: RawRequest, config: C): Promise<void>
+      parse(req: RawRequest, config: C): Promise<RawEvent[]>
+    }
+    poll?: {
+      intervalMs(config: C): number
+      fetch(cursor: SourceCursor | null, config: C): Promise<{ events: RawEvent[]; next: SourceCursor }>
+    }
+
+    // 规范化：源自己的词汇 -> 域模型
+    normalize(raw: RawEvent, config: C): NormalizedTrigger
+
+    // 一个事件可能属于多个 Thread（例如 PR 同时属于 issue 和 review）
+    threadsOf(t: NormalizedTrigger): ThreadKey[]
+
+    // 写侧
+    channel?: ChannelAdapter<C>
+
+    // 上下文读取（给 Router / Worker 召回）
+    context?: ContextReader<C>
+
+    // 管理端表单元数据
+    fields: FieldSpec[]
+  }
+
+  export interface ChannelAdapter<C> {
+    send(msg: OutboundMessage, config: C, signal: AbortSignal): Promise<'sent' | 'gone'>
+    link(address: ChannelAddress): { url: string; label: string }
+  }
+
+7.2 新增一个来源的完整步骤
+
+以 GitLab 为例：
+  1 packages/sources/src/gitlab/ 实现 SourceKind
+  2 在 source registry 注册：
+        registry.register(gitlabKind)
+  3 管理端配置一个 source_instance：domain、项目、事件类型、机器人身份
+  4 不需要改 core、API、数据库 schema、worker loop
+
+  事件到达后：
+    POST /api/sources/gitlab/webhook
+    -> gitlabKind.webhook.verify
+    -> gitlabKind.normalize
+    -> 统一 ingest 流程
+
+7.3 首期来源
+
+  github    PR / review / issue / CI；webhook 为主
+  feishu    IM 话题；webhook + 历史补齐
+  webhook   通用 JSON 入口，用于企业自研系统和本地 agent
+  poll     只作为来源内部的读取方式，不单列 kind
+
+首期验收只需要 github + feishu，证明两种不同来源共用一条链路。
+
+7.4 Trigger envelope
+
+  {
+    triggerId, tenantId, domainId,
+    sourceInstanceId, source: "github",
+    sourceEventId, objectType: "pull_request", objectId: "repo#123",
+    objectVersion, actor: { id, kind: "human" | "bot", display },
+    occurredAt, receivedAt,
+    threadKeys: ["github:repo:pr:123"],
+    causationId, correlationId,
+    contentType, summary, payloadRef,
+    visibility: { scope: "domain" }
+  }
+
+外部文本一律视为不可信数据：
+  - 只能成为模型输入，不能成为权限指令
+  - 工具执行边界再次校验权限，不信任模型自述
+
+
+8. 扩展点 B：Worker Session
+--------------------------------------------------------------------
+
+8.1 SPI 定义
+
+  // packages/contracts/src/runtime.ts
+  export interface WorkerRuntime {
+    type: string                          // "builtin" | "claude-sdk" | "remote-agent" | ...
+    start(spec: WorkerSpec, ctx: RuntimeContext): Promise<WorkerHandle>
+  }
+
+  export interface WorkerHandle {
+    sessionId: string
+    send(input: WorkerInput): Promise<void>       // 投递新输入，不阻塞
+    cancel(reason: string): Promise<void>
+    events(): AsyncIterable<WorkerEvent>          // 增量事件流
+    dispose(): Promise<void>
+  }
+
+  export interface RuntimeContext {
+    store: Repositories
+    artifacts: ArtifactStore
+    tools: ToolRegistry
+    models: ModelGateway
+    signal: AbortSignal
+    report(event: WorkerEvent): void
+  }
+
+  export type WorkerEvent =
+    | { type: 'started'; at: string }
+    | { type: 'assistant_delta'; text: string }
+    | { type: 'tool_call'; callId: string; name: string; input: unknown }
+    | { type: 'tool_result'; callId: string; ok: boolean; outputRef?: string }
+    | { type: 'report'; report: Report }
+    | { type: 'awaiting_input'; question: string }
+    | { type: 'awaiting_approval'; approvalId: string }
+    | { type: 'finished'; outcome: 'succeeded' | 'failed' | 'cancelled'; summary: string }
+
+8.2 首期实现
+
+  builtin
+    我们自己的 ReAct loop：
+      ModelGateway + ToolRegistry + 上下文组装 + 预算控制
+    每个 Task 一个 session，事件落 session_events
+    支持异步 operation：start / poll / stop 语义
+    这一实现保证项目不依赖任何外部 agent 产品
+
+  http-agent（预留）
+    企业已有 agent 或本地 daemon 通过 HTTP 注册：
+      POST /api/runtime-sessions
+      平台下发 WorkerSpec，对方回传 WorkerEvent 流（SSE 或轮询）
+    只依赖契约，不要求对方用 Node
+
+  mock
+    测试与回放用，固定输出事件序列
+
+  后续可加 docker-worker（每个任务一个容器）等，不影响核心。
+
+8.3 Tool 与能力边界
+
+  export interface Tool {
+    name: string
+    description: string
+    inputSchema: z.ZodType
+    risk: 'read' | 'write_workspace' | 'external_side_effect'
+    requiredCapability: Capability
+    execute(ctx: ToolContext, input: unknown): Promise<ToolResult>
+  }
+
+  ToolRegistry 在每次执行前检查：
+    - Task 的 allowed_actions
+    - 当前 actor / domain 授权
+    - 审批是否覆盖当前动作与目标版本
+    - 取消状态与 plan_version
+
+  首期工具：
+    read_file / list_dir / search_code
+    git_*（只读：status/diff/log）
+    write_file（仅工作目录）
+    run_command（白名单 + 超时 + 资源限制）
+    read_trigger / read_thread / read_task / read_session_summary / read_artifact
+
+  任意 shell 默认不给；需要时由企业策略显式开启，并使用专用受限账号。
+
+8.4 Context 组装
+
+  Router 视图：任务摘要、未决决策、跨任务关系、最近事件。
+  Worker 视图：当前 Trigger、Thread 近邻、已确认规则、相关代码/日志、证据引用。
+
+  Inline：当前事件、短摘要、关键规则、对象 ID
+  Spill：长 diff、长日志、完整历史、附件 -> artifacts + 引用
+  每次注入标注意：版本、是否截断、续读入口。
+  安全约束、取消意图、未决审批不参与摘要压缩。
+
+
+9. 一致性、恢复与 Watchdog
+--------------------------------------------------------------------
+
+9.1 投递语义
+
+  至少一次投递，消费者幂等。
+  唯一键：
+    triggers(source_event_id)
+    worker_inputs(session_id, trigger_id)
+    outbox(idem_key)
+    assignments(task_id, attempt)
+  外部动作：
+    支持幂等键就用；不支持则先查目标状态。
+    超时且可能已执行 -> uncertain，进入人工核查，不自动重发。
+
+9.2 恢复
+
+  进程重启后：
+    1 读取 inbox 未完成项
+    2 校验租约 / fencing_token
+    3 校验 task plan_version、取消状态、授权
+    4 恢复或新建 Assignment
+  不重放已完成外部动作；不静默替换执行环境。
+
+9.3 Watchdog
+
+  独立定时循环，默认 30s：
+    确定性检查：队列年龄、心跳、租约过期、outbox 堆积、预算超限、session 无事件
+    进展检查：连续失败、重复工具调用、长时间无新证据
+    动作：重新入队、释放租约、标记 blocked、通知责任人、请求人工接管
+  有次数与预算上限；不能绕过审批或扩大权限。
+  告警本身交给基础设施监控，不递归造监督 agent。
+
+9.4 成本与配额
+
+  usage_records 按 domain/task/model 记录 token 与费用。
+  每个 Task 有 budget；Router 批次有 batch budget。
+  超限：暂停新工作，保留现场，通知责任人；不静默继续烧钱。
+
+
+10. 安全与多租户
+--------------------------------------------------------------------
+
+- tenant_id / domain_id 由服务端根据已认证身份解析，不接受客户端自报。
+- 所有 Repository 查询强制带 tenant/domain 条件；越权返回 not found，不泄露存在性。
+- 权限分层：查看、创建产物、写代码、发消息、合并、发布、审批分别授权。
+- 外部内容（工单、PR 评论、检索结果、工具输出）标记为 untrusted，不能提升权限。
+- 私有来源的数据只进同权限 Worker；派生摘要继承来源约束，不回灌公共 Router。
+- 审计：谁、代表谁、为了哪个 Task、做了什么、结果如何。
+- 密钥仅存在服务端，不进模型上下文；工具使用短期凭据。
+- 模型调用遵守企业数据边界；ModelGateway 按 domain 决定可用模型与是否允许外发。
+
+
+11. 首期范围
+--------------------------------------------------------------------
+
+做：
+  1 企业 / 协作域 / 成员 / 角色
+  2 GitHub + 飞书两个来源，webhook 接入
+  3 Trigger 去重、Thread、订阅直通、有界 Router Batch
+  4 Router 结构化决策，创建 Task
+  5 builtin WorkerRuntime，异步执行、工具、证据
+  6 Outbox 回复 IM / PR 评论
+  7 平台页面：任务、会话、通知、审批、审计、来源配置
+  8 Watchdog、预算、停止与撤权
+
+不做：
+  域内多层 Router、通用 A2A、全自动长期记忆演化、
+  任意机器远程 shell、全渠道连接器、自动生产发布、
+  每模块一个微服务、图数据库、向量数据库。
+
+里程碑：
+  M0  monorepo、compose、迁移、健康检查、鉴权骨架
+  M1  Trigger ingest、Thread、订阅、GitHub 来源
+  M2  Router batch、Evaluation、Task、Assignment
+  M3  WorkerRuntime、builtin loop、Outbox、飞书来源
+  M4  前端主要页面、Watchdog、预算、审计
+  M5  第二个 WorkerRuntime 适配器 + 扩展文档
+
+每个里程碑以 architecture.md 的 AT-01 到 AT-12 逐条验收，
+不以下列"能跑通"代替正确性：
+  - 噪音事件不调模型
+  - 已订阅事件直通
+  - 取消不被批处理阻塞
+  - 重投不重复对外发送
+  - 旧 fencing token 写入被拒绝
+
+
+12. 待确认决策
+--------------------------------------------------------------------
+
+1 ORM：Drizzle（推荐，SQL 可控）还是 Prisma？
+2 鉴权：直接对接哪个 OIDC / SSO？是否需要内置账号密码作为兜底？
+3 首期第二个来源：飞书还是 GitLab？
+4 Worker 执行隔离：同进程目录隔离够用，还是首期就要容器级隔离？
+5 模型供应商与数据边界：允许哪些模型处理企业代码？
+6 部署环境：单机 compose 即可，还是需要 k8s 兼容的镜像形态？
+7 前端范围：只做任务/通知/审批，还是首期就要来源配置向导？
+
+以上确认后再进入 M0 脚手架。
