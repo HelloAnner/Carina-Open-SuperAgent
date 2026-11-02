@@ -32,7 +32,8 @@ API            Fastify + zod + OpenAPI；SSE 推进前端事件
 队列/协调      Redis 7：wakeup、租约、限流、缓存、SSE 扇出
 前端           React 18 + Vite + TanStack Query，Nginx 托管静态文件
 鉴权           OIDC / 企业 SSO 适配器；开发环境内置本地登录
-模型           统一 ModelGateway，兼容 OpenAI / Anthropic / 自建兼容接口
+Agent Loop     @deepseek-ai/dsh-sdk-client 驱动 dsh --profile sdk 子进程
+模型           DSH provider/model 配置；不另建模型网关
 对象存储       第一版本地 volume；预留 S3 兼容适配器
 测试           vitest；核心域纯函数单测 + 一条 compose 集成链路
 
@@ -106,13 +107,14 @@ carina/
   packages/
     contracts/      域类型、zod schema、事件定义、SPI 接口
     core/           纯域逻辑：状态机、路由判定、批处理、权限决策
-    persistence/    Drizzle schema、Repository 实现、迁移
-    queue/          Postgres inbox 领取、Redis wakeup、租约与 fencing
-    sources/        Source 注册表 + github / feishu / webhook 适配器
-    agent/          ModelGateway、Router 会话、上下文组装、召回工具
-    runtime/        WorkerRuntime SPI + builtin/runtime-http 实现 + Tool 执行
-    channels/       Channel 适配器：IM 回复、PR 评论、平台通知
-    observability/  日志、指标、trace、审计辅助
+    persistence/    Drizzle schema、Store、迁移、本地 artifact store
+    queue/          Postgres inbox 领取、Redis wakeup/租约/SSE 事件总线
+    sources/        Source 注册表 + github / webhook 适配器
+    agent/          DSH SDK 适配：Router 会话、Worker Runtime、权限 patch
+    runtime/        WorkerRuntime 注册表 + stub runtime（无模型跑通链路）
+    channels/       Channel 注册表：github 评论、webhook 回复、平台内通知
+    application/    Ingest / Router / Executor / Outbox / Watchdog 服务
+    observability/  结构化日志
   docker/
     compose.yml
     Dockerfile
@@ -446,9 +448,9 @@ Worker 的会话事件、工具调用、证据全部落库；长内容写 artifa
 
 8.1 SPI 定义
 
-  // packages/contracts/src/runtime.ts
+  // packages/contracts/src/ports.ts
   export interface WorkerRuntime {
-    type: string                          // "builtin" | "claude-sdk" | "remote-agent" | ...
+    type: string                          // "dsh" | "stub" | future adapters
     start(spec: WorkerSpec, ctx: RuntimeContext): Promise<WorkerHandle>
   }
 
@@ -461,12 +463,12 @@ Worker 的会话事件、工具调用、证据全部落库；长内容写 artifa
   }
 
   export interface RuntimeContext {
-    store: Repositories
+    tenantId: string
+    domainId: string
+    workspaceDir: string
     artifacts: ArtifactStore
-    tools: ToolRegistry
-    models: ModelGateway
     signal: AbortSignal
-    report(event: WorkerEvent): void
+    log: Logger
   }
 
   export type WorkerEvent =
@@ -477,53 +479,73 @@ Worker 的会话事件、工具调用、证据全部落库；长内容写 artifa
     | { type: 'report'; report: Report }
     | { type: 'awaiting_input'; question: string }
     | { type: 'awaiting_approval'; approvalId: string }
-    | { type: 'finished'; outcome: 'succeeded' | 'failed' | 'cancelled'; summary: string }
+    | { type: 'finished'; outcome: 'succeeded'|'failed'|'cancelled'|'blocked'|'awaiting_input'; summary: string }
 
-8.2 首期实现
+  WorkerSpec 额外携带 application 组装好的 prompt。WorkerRuntime 不负责
+  检索数据库、不负责权限判定，只负责把这一轮工作跑完并回传事件。
 
-  builtin
-    我们自己的 ReAct loop：
-      ModelGateway + ToolRegistry + 上下文组装 + 预算控制
-    每个 Task 一个 session，事件落 session_events
-    支持异步 operation：start / poll / stop 语义
-    这一实现保证项目不依赖任何外部 agent 产品
+8.2 DSH 运行时（首期默认）
 
-  http-agent（预留）
-    企业已有 agent 或本地 daemon 通过 HTTP 注册：
-      POST /api/runtime-sessions
-      平台下发 WorkerSpec，对方回传 WorkerEvent 流（SSE 或轮询）
-    只依赖契约，不要求对方用 Node
+  依赖：
+    @deepseek-ai/dsh-sdk-client   驱动 DSH runtime 子进程
+    @deepseek-ai/dsh              dsh CLI
+    @deepseek-ai/dsh-sdk-app      sdk profile bundle
 
-  mock
-    测试与回放用，固定输出事件序列
+  结构：
 
-  后续可加 docker-worker（每个任务一个容器）等，不影响核心。
+    worker 进程
+      └─ DshWorkerRuntime
+           └─ 每个 Assignment 一个 dsh --profile sdk 子进程
+                └─ 一个 DSH Session
+                     ├─ 模型调用
+                     ├─ 文件 / bash / 搜索工具
+                     └─ session.event -> WorkerEvent
 
-8.3 Tool 与能力边界
+  绑定方式：
+    harness.session(`worker-<taskId>-<assignmentId>`).run(prompt)
+    onNotification 把 session.event 翻译成 WorkerEvent
+    run 返回后检查 turn/end：
+      error / blocked / max-tokens / aborted -> failed
+      否则解析最后一条 assistant 文本为结构化 report
+    最终 JSON 不符合契约时按 ready 记录，不伪造验证结论
 
-  export interface Tool {
-    name: string
-    description: string
-    inputSchema: z.ZodType
-    risk: 'read' | 'write_workspace' | 'external_side_effect'
-    requiredCapability: Capability
-    execute(ctx: ToolContext, input: unknown): Promise<ToolResult>
-  }
+  Router：
+    每个 Domain 一个 DSH Session，进程内复用
+    DSH 会持久化 session，重启后不能重建同 ID，因此 ID 带进程随机后缀
+    逻辑连续性来自每轮重新注入的任务与事件上下文，不依赖无限增长的窗口
 
-  ToolRegistry 在每次执行前检查：
-    - Task 的 allowed_actions
-    - 当前 actor / domain 授权
-    - 审批是否覆盖当前动作与目标版本
-    - 取消状态与 plan_version
+  取消：
+    DSH SDK 没有 mid-turn cancel。cancel 关闭该 Assignment 的 runtime 子进程，
+    标记 cancelled；不声称已撤回的外部动作由 Report 说明。
 
-  首期工具：
-    read_file / list_dir / search_code
-    git_*（只读：status/diff/log）
-    write_file（仅工作目录）
-    run_command（白名单 + 超时 + 资源限制）
-    read_trigger / read_thread / read_task / read_session_summary / read_artifact
+  stub：
+    DSH_RUNTIME=stub 时使用确定性的 StubWorkerRuntime / StubRouterAgent。
+    无模型凭证也能跑通 ingest -> Router -> Task -> Worker -> Outbox。
 
-  任意 shell 默认不给；需要时由企业策略显式开启，并使用专用受限账号。
+8.3 权限与工具边界
+
+  DSH 自带文件与 bash 工具，因此权限必须在启动子进程时收紧，不能只写在 prompt 里。
+
+  每个 Assignment 生成一份 patch（workspace/.carina/cordis.patch.yml）：
+
+    - id: approval
+      config:
+        policy: never              # 无人值守，不做交互式批准
+    - id: sandbox-policy
+      config:
+        mode: read-only | workspace-write
+    - id: tool-web
+      disabled: true               # 首期不允许 worker 访问公网
+    - id: tool-bash
+      disabled: true               # 仅当 allowedActions 不含 run_command
+
+  read-only / workspace-write 由 Task.mandate.allowedActions 决定：
+    write_workspace 或 run_command -> workspace-write
+    其他                           -> read-only
+  Router 会话固定 read-only，并关闭 bash、web、subagent、workflow。
+
+  这一层是硬边界；prompt 里的 "不要越权" 只是补充说明。
+  审批、合并、发布等外部动作仍不在 Worker 权限内，后续通过 Approval + 执行路径扩展。
 
 8.4 Context 组装
 
@@ -586,7 +608,7 @@ Worker 的会话事件、工具调用、证据全部落库；长内容写 artifa
 - 私有来源的数据只进同权限 Worker；派生摘要继承来源约束，不回灌公共 Router。
 - 审计：谁、代表谁、为了哪个 Task、做了什么、结果如何。
 - 密钥仅存在服务端，不进模型上下文；工具使用短期凭据。
-- 模型调用遵守企业数据边界；ModelGateway 按 domain 决定可用模型与是否允许外发。
+- 模型调用遵守企业数据边界；DSH provider/model 与可用外发范围按 domain 配置。
 
 
 11. 首期范围
@@ -597,7 +619,7 @@ Worker 的会话事件、工具调用、证据全部落库；长内容写 artifa
   2 GitHub + 飞书两个来源，webhook 接入
   3 Trigger 去重、Thread、订阅直通、有界 Router Batch
   4 Router 结构化决策，创建 Task
-  5 builtin WorkerRuntime，异步执行、工具、证据
+  5 DSH WorkerRuntime，异步执行、工具、证据
   6 Outbox 回复 IM / PR 评论
   7 平台页面：任务、会话、通知、审批、审计、来源配置
   8 Watchdog、预算、停止与撤权
@@ -611,7 +633,7 @@ Worker 的会话事件、工具调用、证据全部落库；长内容写 artifa
   M0  monorepo、compose、迁移、健康检查、鉴权骨架
   M1  Trigger ingest、Thread、订阅、GitHub 来源
   M2  Router batch、Evaluation、Task、Assignment
-  M3  WorkerRuntime、builtin loop、Outbox、飞书来源
+  M3  DSH WorkerRuntime、Outbox、第二个来源
   M4  前端主要页面、Watchdog、预算、审计
   M5  第二个 WorkerRuntime 适配器 + 扩展文档
 
@@ -636,3 +658,40 @@ Worker 的会话事件、工具调用、证据全部落库；长内容写 artifa
 7 前端范围：只做任务/通知/审批，还是首期就要来源配置向导？
 
 以上确认后再进入 M0 脚手架。
+
+
+13. 当前实现状态（M0-M3 骨架）
+--------------------------------------------------------------------
+
+已实现：
+  - pnpm monorepo，contracts / core / persistence / queue / sources /
+    agent / runtime / channels / application / observability
+  - Postgres schema 与迁移；Store 覆盖 trigger、thread、subscription、
+    evaluation、task、assignment、worker session、outbox、usage、audit
+  - github + webhook 两个 SourceKind；签名校验、去重、Thread 映射
+  - Ingest / Router / Executor / Outbox / Watchdog 五个应用服务
+  - DSH SDK 适配：每个 Assignment 一个 dsh --profile sdk 子进程；
+    Router 使用 Domain 级 DSH Session；turn/end 错误识别
+  - 每任务权限 patch：read-only / workspace-write、按 allowedActions
+    关闭 bash、关闭 web
+  - Fast Path 订阅直通；已结束任务被新事件重新唤醒（attempt + 1）
+  - Stub runtime：无模型凭证也能跑通完整链路
+  - Fastify API、SSE、React 控制台
+  - docker-compose：postgres / redis / api / worker / web
+
+已验证：
+  - tsc --noEmit 通过；vitest 10 个核心用例通过
+  - 本地真实 Postgres/Redis + stub：事件 -> Router 决策 -> Task ->
+    Worker -> Report -> Outbox 全链路完成
+  - 同一 Thread 第二条事件：Fast Path 直通并恢复原 Task（attempt 2）
+  - DSH 运行时：子进程启动、handshake、session event、turn/end
+    错误识别、按任务权限 patch 加载均通过
+  - Web 生产构建通过
+
+当前缺口：
+  - OIDC / SSO 与真实 RBAC，仅有 API key
+  - Approval 页面与高风险动作执行路径
+  - 飞书 Source、知识库、长期记忆、链式召回
+  - 工作区 prepare（clone / 依赖安装）与容器级隔离
+  - DSH 模型凭证与 provider 路由需要在部署时配置
+  - SDK 无 mid-turn cancel；取消以关闭子进程实现

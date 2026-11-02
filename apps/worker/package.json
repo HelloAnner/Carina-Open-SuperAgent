@@ -1,0 +1,21 @@
+{
+  "name": "@carina/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/main.ts",
+  "scripts": {
+    "dev": "tsx watch src/main.ts"
+  },
+  "dependencies": {
+    "@carina/agent": "workspace:*",
+    "@carina/application": "workspace:*",
+    "@carina/channels": "workspace:*",
+    "@carina/contracts": "workspace:*",
+    "@carina/observability": "workspace:*",
+    "@carina/persistence": "workspace:*",
+    "@carina/queue": "workspace:*",
+    "@carina/runtime": "workspace:*",
+    "@carina/sources": "workspace:*"
+  }
+}

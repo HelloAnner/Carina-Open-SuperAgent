@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "jsx": "react-jsx",
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@carina/contracts": ["packages/contracts/src/index.ts"],
+      "@carina/core": ["packages/core/src/index.ts"],
+      "@carina/persistence": ["packages/persistence/src/index.ts"],
+      "@carina/queue": ["packages/queue/src/index.ts"],
+      "@carina/sources": ["packages/sources/src/index.ts"],
+      "@carina/agent": ["packages/agent/src/index.ts"],
+      "@carina/runtime": ["packages/runtime/src/index.ts"],
+      "@carina/channels": ["packages/channels/src/index.ts"],
+      "@carina/application": ["packages/application/src/index.ts"],
+      "@carina/observability": ["packages/observability/src/index.ts"]
+    }
+  },
+  "include": ["apps/api/**/*.ts", "apps/worker/**/*.ts", "packages/**/*.ts"],
+  "exclude": ["node_modules", "**/dist", "apps/web"]
+}

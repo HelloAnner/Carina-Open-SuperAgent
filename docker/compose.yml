@@ -1,0 +1,114 @@
+name: carina
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: carina
+      POSTGRES_PASSWORD: carina
+      POSTGRES_DB: carina
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U carina -d carina"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: app
+    command: ["sh", "-c", "pnpm exec tsx packages/persistence/src/migrate.ts && pnpm exec tsx apps/api/src/main.ts"]
+    environment:
+      DATABASE_URL: postgres://carina:carina@postgres:5432/carina
+      REDIS_URL: redis://redis:6379
+      PORT: "8080"
+      BOOTSTRAP: "true"
+      CARINA_API_KEY: ${CARINA_API_KEY:-}
+      DEMO_WEBHOOK_SECRET: ${DEMO_WEBHOOK_SECRET:-}
+      GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: app
+    command: ["pnpm", "exec", "tsx", "apps/worker/src/main.ts"]
+    environment:
+      DATABASE_URL: postgres://carina:carina@postgres:5432/carina
+      REDIS_URL: redis://redis:6379
+      WORKER_ROLE: ${WORKER_ROLE:-all}
+      WORKER_RUNTIME: ${WORKER_RUNTIME:-stub}
+      DSH_RUNTIME: ${DSH_RUNTIME:-stub}
+      DSH_PROVIDER: ${DSH_PROVIDER:-deepseek-official}
+      DSH_MODEL: ${DSH_MODEL:-deepseek-v4-flash}
+      DSH_ROUTER_MODEL: ${DSH_ROUTER_MODEL:-}
+      DSH_WORKER_MODEL: ${DSH_WORKER_MODEL:-}
+      DSH_MAX_TOKENS: ${DSH_MAX_TOKENS:-49152}
+      DSH_HOME: ${DSH_HOME:-/root/.dsh}
+      DSH_PATCHES: ${DSH_PATCHES:-}
+      WORKSPACE_ROOT: /data/workspaces
+      ARTIFACT_DIR: /data/artifacts
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - artifacts:/data
+      - dshhome:/root/.dsh
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: web
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  pgdata:
+  redisdata:
+  artifacts:
+  dshhome:

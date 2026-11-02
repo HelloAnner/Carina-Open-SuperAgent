@@ -1,0 +1,16 @@
+{
+  "name": "@carina/persistence",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@carina/contracts": "workspace:*",
+    "drizzle-orm": "^0.44.7",
+    "postgres": "^3.4.7"
+  }
+}

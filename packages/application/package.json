@@ -1,0 +1,20 @@
+{
+  "name": "@carina/application",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@carina/channels": "workspace:*",
+    "@carina/contracts": "workspace:*",
+    "@carina/core": "workspace:*",
+    "@carina/persistence": "workspace:*",
+    "@carina/queue": "workspace:*",
+    "@carina/runtime": "workspace:*",
+    "@carina/sources": "workspace:*"
+  }
+}

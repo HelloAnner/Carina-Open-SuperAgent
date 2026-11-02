@@ -1,0 +1,50 @@
+{
+  "name": "carina",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter @carina/api --filter @carina/worker --filter @carina/web dev",
+    "dev:api": "tsx watch apps/api/src/main.ts",
+    "dev:worker": "tsx watch apps/worker/src/main.ts",
+    "dev:web": "pnpm --filter @carina/web dev",
+    "typecheck": "tsc --noEmit && tsc -p apps/web/tsconfig.json --noEmit",
+    "test": "vitest run",
+    "migrate": "tsx packages/persistence/src/migrate.ts",
+    "build:web": "pnpm --filter @carina/web build"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "drizzle-orm": "^0.44.7",
+    "fastify": "^5.6.1",
+    "ioredis": "^5.8.1",
+    "postgres": "^3.4.7",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "@types/react": "^18.3.28",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^5.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.12",
+    "vitest": "^3.2.4"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@deepseek-ai/dsh-subprocess-local",
+      "@google/genai",
+      "esbuild",
+      "koffi",
+      "node-pty",
+      "protobufjs"
+    ]
+  }
+}
